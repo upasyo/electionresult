@@ -1,0 +1,6 @@
+{
+  "name": "US Midterm Election Day 2026 Live Results & News",
+  "description": "Real-time U.S. Midterm Election Day 2026 newsroom, live Senate/House/Governor results, interactive US map, AI election analysis, and OBS broadcast graphics suite.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
