@@ -14,6 +14,8 @@ interface HeaderProps {
   setIsElectionNightMode: (val: boolean) => void;
   onOpenOBSGraphics: () => void;
   isLiveReporting: boolean;
+  onOpenCMS?: () => void;
+  onOpenDesk?: () => void;
 }
 
 export const Header: React.FC<HeaderProps> = ({
@@ -23,7 +25,9 @@ export const Header: React.FC<HeaderProps> = ({
   isElectionNightMode,
   setIsElectionNightMode,
   onOpenOBSGraphics,
-  isLiveReporting
+  isLiveReporting,
+  onOpenCMS,
+  onOpenDesk
 }) => {
   const [timeET, setTimeET] = useState('');
   const [timeLocal, setTimeLocal] = useState('');
@@ -141,6 +145,27 @@ export const Header: React.FC<HeaderProps> = ({
             <Monitor className="w-3.5 h-3.5 text-blue-600" />
             <span>OBS Source</span>
           </button>
+
+          {onOpenDesk && (
+            <button
+              onClick={onOpenDesk}
+              className="hidden lg:inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-md text-xs font-bold bg-rose-600 hover:bg-rose-700 text-white whitespace-nowrap transition-colors shadow-xs"
+              title="Open Live Election Day Desk"
+            >
+              <Tv className="w-3.5 h-3.5" />
+              <span>Live Desk</span>
+            </button>
+          )}
+
+          {onOpenCMS && (
+            <button
+              onClick={onOpenCMS}
+              className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-md text-xs font-medium bg-slate-100 hover:bg-slate-200 text-slate-800 border border-slate-300 whitespace-nowrap transition-colors shadow-2xs"
+              title="Open CMS Administrator Console"
+            >
+              <span>CMS Admin</span>
+            </button>
+          )}
 
           <button
             onClick={onOpenAdmin}

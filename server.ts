@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import express, { Request, Response } from 'express';
+import express, { Request, Response, NextFunction } from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
@@ -18,6 +18,7 @@ import {
   calculateNationalOverview
 } from './src/data/election2026Data.js';
 import { AdminConfig, SenateRace, GovernorRace, HouseDistrict } from './src/types/election.js';
+import { cmsDb, CMSSettings, UserRole } from './src/db/cmsDatabase.js';
 
 dotenv.config();
 
@@ -28,20 +29,6 @@ const app = express();
 const PORT = Number(process.env.PORT) || 3000;
 
 app.use(express.json());
-
-// In-memory application state
-let adminConfig: AdminConfig = {
-  mode: 'countdown', // 'countdown' | 'live_simulation' | 'external_api'
-  activeProvider: 'DECISION_DESK',
-  pollingIntervalSeconds: 30,
-  youtubeVideoId: 'f0lYkdA-Gtw', // PBS NewsHour / election live coverage stream placeholder
-  broadcastTitle: 'Decision Desk 2026: U.S. Midterm Election Live',
-  broadcastDescription: 'Real-time race calls, Senate and House balance of power, and battleground analysis.',
-  enableNewsFeed: true,
-  simulationProgressPct: 0,
-  hasAPCredentials: Boolean(process.env.AP_API_KEY),
-  hasFECCredentials: Boolean(process.env.FEC_API_KEY)
-};
 
 // Simulation state cache
 let currentSenateRaces: SenateRace[] = JSON.parse(JSON.stringify(INITIAL_SENATE_RACES));
@@ -66,11 +53,11 @@ if (process.env.GEMINI_API_KEY) {
   }
 }
 
-// Helper to simulate live vote progression when admin config is in 'live_simulation'
+// Helper to simulate live vote progression
 function updateSimulationState(progressPct: number) {
-  const isSim = adminConfig.mode === 'live_simulation';
+  const settings = cmsDb.getSettings();
+  const isSim = settings.simulation.mode === 'live_simulation' || settings.forcedElectionDayMode;
   if (!isSim || progressPct <= 0) {
-    // Reset to pre-election uncalled state
     currentSenateRaces = JSON.parse(JSON.stringify(INITIAL_SENATE_RACES));
     currentGovernorRaces = JSON.parse(JSON.stringify(INITIAL_GOVERNOR_RACES));
     currentHouseDistricts = JSON.parse(JSON.stringify(INITIAL_HOUSE_DISTRICTS));
@@ -80,7 +67,6 @@ function updateSimulationState(progressPct: number) {
   // Update Senate races
   currentSenateRaces = INITIAL_SENATE_RACES.map((race, idx) => {
     const copy = JSON.parse(JSON.stringify(race)) as SenateRace;
-    // Calculate state progress based on index and overall sim progress
     const stateThreshold = (idx / INITIAL_SENATE_RACES.length) * 100;
     const reporting = Math.min(100, Math.max(0, Math.round((progressPct - stateThreshold * 0.4) * 1.6)));
 
@@ -89,7 +75,6 @@ function updateSimulationState(progressPct: number) {
       const baseVotes = 1200000 + (idx * 140000);
       copy.totalVotes = Math.round((reporting / 100) * baseVotes);
 
-      // Candidate votes
       const demBase = copy.keyRace ? 0.49 : 0.46 + ((idx % 3) * 0.05);
       const repBase = 1 - demBase - 0.02;
 
@@ -104,7 +89,6 @@ function updateSimulationState(progressPct: number) {
       });
 
       if (reporting >= 90) {
-        // Call race
         const winner = copy.candidates.reduce((prev, curr) => (curr.votes > prev.votes ? curr : prev));
         copy.status = winner.party === 'DEM' ? 'called_dem' : winner.party === 'REP' ? 'called_rep' : 'called_ind';
         copy.winnerParty = winner.party;
@@ -195,18 +179,67 @@ function updateSimulationState(progressPct: number) {
 }
 
 // -----------------------------------------------------------------------------
-// API Endpoints
+// CMS Security & Authorization Middleware
 // -----------------------------------------------------------------------------
+function requireCMSAuth(req: Request, res: Response, next: NextFunction) {
+  const authHeader = req.headers.authorization;
+  const token = authHeader?.startsWith('Bearer ')
+    ? authHeader.slice(7)
+    : (req.headers['x-cms-token'] as string);
+
+  const session = cmsDb.validateSession(token);
+  if (!session) {
+    return res.status(401).json({ success: false, error: 'Unauthorized: valid CMS session required' });
+  }
+
+  (req as any).cmsUser = session;
+  next();
+}
+
+// -----------------------------------------------------------------------------
+// Public Endpoints
+// -----------------------------------------------------------------------------
+
+// GET /api/public/config: Returns synced public settings for client visitors
+app.get('/api/public/config', (req: Request, res: Response) => {
+  const settings = cmsDb.getSettings();
+  const targetTime = new Date(settings.countdownTargetISO).getTime();
+  const now = Date.now();
+  const isExpired = now >= targetTime;
+  const shouldOpenElectionDayDesk = (isExpired || settings.forcedElectionDayMode) && settings.autoOpenElectionDayDesk;
+
+  res.json({
+    success: true,
+    countdownTargetISO: settings.countdownTargetISO,
+    targetDescription: settings.targetDescription,
+    isExpired,
+    forcedElectionDayMode: settings.forcedElectionDayMode,
+    autoOpenElectionDayDesk: settings.autoOpenElectionDayDesk,
+    shouldOpenElectionDayDesk,
+    broadcastTitle: settings.broadcastTitle,
+    broadcastDescription: settings.broadcastDescription,
+    breakingAnnouncement: settings.breakingAnnouncement,
+    youtubeVideoId: settings.youtubeVideoId,
+    youtubeAutoPlay: settings.youtubeAutoPlay,
+    audio: settings.audio,
+    layouts: settings.layouts,
+    simulationProgressPct: settings.simulation.progressPct,
+    activeProvider: settings.simulation.activeProvider,
+    pollingIntervalSeconds: settings.simulation.pollingIntervalSeconds,
+    timestamp: new Date().toISOString()
+  });
+});
 
 // GET /api/elections/overview
 app.get('/api/elections/overview', (req: Request, res: Response) => {
-  const isSimulation = adminConfig.mode === 'live_simulation';
+  const settings = cmsDb.getSettings();
+  const isSimulation = settings.simulation.mode === 'live_simulation' || settings.forcedElectionDayMode;
   const overview = calculateNationalOverview(
     currentSenateRaces,
     currentHouseDistricts,
     currentGovernorRaces,
     isSimulation,
-    adminConfig.simulationProgressPct
+    settings.simulation.progressPct
   );
   res.json({
     success: true,
@@ -275,19 +308,13 @@ app.get('/api/elections/states', (req: Request, res: Response) => {
 app.get('/api/elections/race/:raceId', (req: Request, res: Response) => {
   const { raceId } = req.params;
   const senate = currentSenateRaces.find((r) => r.id === raceId || r.state === raceId);
-  if (senate) {
-    return res.json({ success: true, type: 'senate', race: senate });
-  }
+  if (senate) return res.json({ success: true, type: 'senate', race: senate });
 
   const gov = currentGovernorRaces.find((r) => r.id === raceId || r.state === raceId);
-  if (gov) {
-    return res.json({ success: true, type: 'governor', race: gov });
-  }
+  if (gov) return res.json({ success: true, type: 'governor', race: gov });
 
   const house = currentHouseDistricts.find((r) => r.id === raceId);
-  if (house) {
-    return res.json({ success: true, type: 'house', race: house });
-  }
+  if (house) return res.json({ success: true, type: 'house', race: house });
 
   res.status(404).json({ success: false, error: 'Race not found' });
 });
@@ -322,32 +349,58 @@ app.get('/api/elections/timeline', (req: Request, res: Response) => {
   });
 });
 
-// GET /api/admin/config
+// GET /api/admin/config - Legacy admin widget config synchronized with CMS settings
 app.get('/api/admin/config', (req: Request, res: Response) => {
+  const settings = cmsDb.getSettings();
   res.json({
     success: true,
-    config: adminConfig
+    config: {
+      mode: settings.simulation.mode,
+      activeProvider: settings.simulation.activeProvider,
+      pollingIntervalSeconds: settings.simulation.pollingIntervalSeconds,
+      youtubeVideoId: settings.youtubeVideoId,
+      broadcastTitle: settings.broadcastTitle,
+      broadcastDescription: settings.broadcastDescription,
+      enableNewsFeed: true,
+      simulationProgressPct: settings.simulation.progressPct,
+      hasAPCredentials: Boolean(process.env.AP_API_KEY),
+      hasFECCredentials: Boolean(process.env.FEC_API_KEY)
+    }
   });
 });
 
-// POST /api/admin/config
+// POST /api/admin/config - Update simulation / broadcast settings
 app.post('/api/admin/config', (req: Request, res: Response) => {
-  const { mode, activeProvider, pollingIntervalSeconds, youtubeVideoId, simulationProgressPct, broadcastTitle } = req.body;
+  const body = req.body || {};
+  const current = cmsDb.getSettings();
 
-  if (mode !== undefined) adminConfig.mode = mode;
-  if (activeProvider !== undefined) adminConfig.activeProvider = activeProvider;
-  if (pollingIntervalSeconds !== undefined) adminConfig.pollingIntervalSeconds = Number(pollingIntervalSeconds);
-  if (youtubeVideoId !== undefined) adminConfig.youtubeVideoId = String(youtubeVideoId).trim();
-  if (broadcastTitle !== undefined) adminConfig.broadcastTitle = String(broadcastTitle).trim();
-  if (simulationProgressPct !== undefined) {
-    adminConfig.simulationProgressPct = Math.max(0, Math.min(100, Number(simulationProgressPct)));
-    updateSimulationState(adminConfig.simulationProgressPct);
-  }
+  const updatedSettings = cmsDb.updateSettings({
+    simulation: {
+      ...current.simulation,
+      mode: body.mode || current.simulation.mode,
+      activeProvider: body.activeProvider || current.simulation.activeProvider,
+      pollingIntervalSeconds: body.pollingIntervalSeconds || current.simulation.pollingIntervalSeconds,
+      progressPct: body.simulationProgressPct !== undefined ? body.simulationProgressPct : current.simulation.progressPct
+    },
+    youtubeVideoId: body.youtubeVideoId || current.youtubeVideoId,
+    broadcastTitle: body.broadcastTitle || current.broadcastTitle,
+    broadcastDescription: body.broadcastDescription || current.broadcastDescription
+  }, 'admin-widget', req.ip || req.socket.remoteAddress);
 
   res.json({
     success: true,
-    config: adminConfig,
-    message: 'Configuration updated successfully'
+    config: {
+      mode: updatedSettings.simulation.mode,
+      activeProvider: updatedSettings.simulation.activeProvider,
+      pollingIntervalSeconds: updatedSettings.simulation.pollingIntervalSeconds,
+      youtubeVideoId: updatedSettings.youtubeVideoId,
+      broadcastTitle: updatedSettings.broadcastTitle,
+      broadcastDescription: updatedSettings.broadcastDescription,
+      enableNewsFeed: true,
+      simulationProgressPct: updatedSettings.simulation.progressPct,
+      hasAPCredentials: Boolean(process.env.AP_API_KEY),
+      hasFECCredentials: Boolean(process.env.FEC_API_KEY)
+    }
   });
 });
 
@@ -356,11 +409,10 @@ app.post('/api/ai/analyze', async (req: Request, res: Response) => {
   const { prompt, context } = req.body;
 
   if (!aiClient) {
-    // Graceful fallback with expert analytical intelligence if Gemini API key is not configured
     return res.json({
       success: true,
       modelUsed: 'heuristic-analyst-fallback',
-      analysis: `### 2026 Midterm Landscape Assessment\n\n**Senate Battlegrounds:** Georgia (Ossoff vs. Carr), North Carolina (Tillis vs. Cooper), and Maine (Collins vs. Golden) are the central tipping-point races. Historically, midterm elections create pressure on the incumbent party in the White House, with typical net swings of 2–4 Senate seats in competitive cycles.\n\n**House Equilibrium:** With a narrow working majority and 30 toss-up suburban districts in California, New York, and Pennsylvania, House control will likely come down to late Pacific Coast mail-in returns.\n\n**Election Night Dynamics:** Tabulation timelines indicate East Coast polls closing at 19:00 ET (GA, VA, FL) will provide the first barometer of independent voter sentiment.`,
+      analysis: `### 2026 Midterm Landscape Assessment\n\n**Senate Battlegrounds:** Georgia (Ossoff vs. Carr), North Carolina (Tillis vs. Cooper), and Maine (Collins vs. Golden) are the central tipping-point races.\n\n**House Equilibrium:** With a narrow working majority and 30 toss-up suburban districts in California, New York, and Pennsylvania, House control will likely come down to late Pacific Coast mail-in returns.\n\n**Election Night Dynamics:** Tabulation timelines indicate East Coast polls closing will provide the first barometer of independent voter sentiment.`,
       disclaimer: 'Generated via Decision Desk Election Analytics Engine.'
     });
   }
@@ -395,6 +447,157 @@ Format output cleanly with clear headers, bullet points, and high journalistic r
 });
 
 // -----------------------------------------------------------------------------
+// CMS Administrative Endpoints (/api/cms/*)
+// -----------------------------------------------------------------------------
+
+// GET /api/cms/auth/status
+app.get('/api/cms/auth/status', (req: Request, res: Response) => {
+  const isInitialized = cmsDb.isInitialized();
+  const authHeader = req.headers.authorization;
+  const token = authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : (req.headers['x-cms-token'] as string);
+  const session = cmsDb.validateSession(token);
+
+  res.json({
+    success: true,
+    isInitialized,
+    isAuthenticated: Boolean(session),
+    user: session ? { username: session.username, role: session.role } : null
+  });
+});
+
+// POST /api/cms/auth/setup - First-time password setup for Upasyo2007
+app.post('/api/cms/auth/setup', (req: Request, res: Response) => {
+  const { password } = req.body;
+  const ip = req.ip || req.socket.remoteAddress;
+
+  if (cmsDb.isInitialized()) {
+    return res.status(400).json({ success: false, error: 'Administrator credentials already initialized.' });
+  }
+
+  const result = cmsDb.setupInitialAdmin(password, ip);
+  if (!result.success) {
+    return res.status(400).json({ success: false, error: result.error });
+  }
+
+  // Automatically authenticate upon initial setup
+  const auth = cmsDb.authenticate('Upasyo2007', password, ip);
+  res.json({
+    success: true,
+    message: 'Master administrator Upasyo2007 initialized successfully.',
+    token: auth.token,
+    user: auth.user ? { username: auth.user.username, role: auth.user.role } : null
+  });
+});
+
+// POST /api/cms/auth/login
+app.post('/api/cms/auth/login', (req: Request, res: Response) => {
+  const { username, password } = req.body;
+  const ip = req.ip || req.socket.remoteAddress;
+
+  if (!username || !password) {
+    return res.status(400).json({ success: false, error: 'Username and password are required.' });
+  }
+
+  const auth = cmsDb.authenticate(username, password, ip);
+  if (auth.error || !auth.user || !auth.token) {
+    return res.status(401).json({ success: false, error: auth.error || 'Authentication failed' });
+  }
+
+  res.json({
+    success: true,
+    token: auth.token,
+    user: {
+      id: auth.user.id,
+      username: auth.user.username,
+      role: auth.user.role,
+      lastLoginAt: auth.user.lastLoginAt
+    }
+  });
+});
+
+// POST /api/cms/auth/logout
+app.post('/api/cms/auth/logout', requireCMSAuth, (req: Request, res: Response) => {
+  const user = (req as any).cmsUser;
+  if (user?.token) {
+    cmsDb.revokeSession(user.token);
+  }
+  res.json({ success: true, message: 'Logged out successfully' });
+});
+
+// GET /api/cms/settings
+app.get('/api/cms/settings', requireCMSAuth, (req: Request, res: Response) => {
+  const settings = cmsDb.getSettings();
+  res.json({
+    success: true,
+    settings
+  });
+});
+
+// POST /api/cms/settings
+app.post('/api/cms/settings', requireCMSAuth, (req: Request, res: Response) => {
+  const user = (req as any).cmsUser;
+  const ip = req.ip || req.socket.remoteAddress;
+  const updates = req.body;
+
+  const current = cmsDb.getSettings();
+  const updatedSettings = cmsDb.updateSettings(updates, user.username, ip);
+
+  // If simulation settings or forced mode changed, update simulation state
+  if (updates.simulation?.progressPct !== undefined || updates.forcedElectionDayMode !== undefined) {
+    const progress = updates.forcedElectionDayMode ? Math.max(updates.simulation?.progressPct || 40, 40) : (updates.simulation?.progressPct ?? current.simulation.progressPct);
+    updateSimulationState(progress);
+  }
+
+  res.json({
+    success: true,
+    settings: updatedSettings,
+    message: 'CMS settings saved and broadcast successfully.'
+  });
+});
+
+// GET /api/cms/audit-logs
+app.get('/api/cms/audit-logs', requireCMSAuth, (req: Request, res: Response) => {
+  const logs = cmsDb.getAuditLogs();
+  res.json({
+    success: true,
+    logs
+  });
+});
+
+// GET /api/cms/users
+app.get('/api/cms/users', requireCMSAuth, (req: Request, res: Response) => {
+  const users = cmsDb.getUsers();
+  res.json({
+    success: true,
+    users
+  });
+});
+
+// POST /api/cms/change-password
+app.post('/api/cms/change-password', requireCMSAuth, (req: Request, res: Response) => {
+  const user = (req as any).cmsUser;
+  const ip = req.ip || req.socket.remoteAddress;
+  const { currentPassword, newPassword } = req.body;
+
+  if (!newPassword || newPassword.length < 8) {
+    return res.status(400).json({ success: false, error: 'New password must be at least 8 characters long.' });
+  }
+
+  // Re-verify current password
+  const auth = cmsDb.authenticate(user.username, currentPassword, ip);
+  if (auth.error) {
+    return res.status(401).json({ success: false, error: 'Current password verification failed.' });
+  }
+
+  const success = cmsDb.changePassword(user.username, newPassword, user.username, ip);
+  if (!success) {
+    return res.status(500).json({ success: false, error: 'Failed to update password' });
+  }
+
+  res.json({ success: true, message: 'Password updated successfully' });
+});
+
+// -----------------------------------------------------------------------------
 // Vite Middleware / Static Serve
 // -----------------------------------------------------------------------------
 async function setupVite() {
@@ -414,6 +617,8 @@ async function setupVite() {
 
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`[DECISION DESK 2026] Server running at http://0.0.0.0:${PORT}`);
+    console.log(`[CMS SECURE ADMIN] Admin Portal available at http://0.0.0.0:${PORT}/cms-admin`);
+    console.log(`[ELECTION DAY DESK] Live Desk available at http://0.0.0.0:${PORT}/election-day-desk`);
   });
 }
 
